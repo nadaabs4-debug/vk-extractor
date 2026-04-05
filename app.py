@@ -2,56 +2,86 @@ import streamlit as st
 import yt_dlp
 import cv2
 import os
+import zipfile
+import io
 
-st.set_page_config(page_title="VK Video Frames", layout="wide")
-st.title("🖼️ مستخرج فريمات فيديو VK")
+st.set_page_config(page_title="VK Frame Extractor", layout="wide")
+st.title("🎬 مستخرج مقاطع الفريمات من VK")
 
-vk_url = st.text_input("أدخل رابط الفيديو:")
+# 1. إدخال الرابط والحصول على معلومات الفيديو أولاً
+vk_url = st.text_input("أدخل رابط فيديو VK:")
 
-if st.button("ابدأ المعالجة"):
-    if vk_url:
-        status = st.empty()
-        progress_bar = st.progress(0)
-        
-        try:
-            # 1. إعدادات التحميل (تحميل أقل جودة لتوفير الوقت والسعة)
-            status.info("جاري فحص الفيديو وتجهيزه...")
-            ydl_opts = {
-                'format': 'worst', # نختار أقل جودة لأننا نريد صوراً فقط
-                'outtmpl': 'temp_video.mp4',
-                'noplaylist': True,
-            }
-            
+if vk_url:
+    try:
+        with st.spinner('جاري فحص مدة الفيديو...'):
+            ydl_opts = {'format': 'worst', 'noplaylist': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                status.info("جاري تحميل مقطع صغير للمعالجة...")
-                ydl.download([vk_url])
-            
-            # 2. فتح ملف الفيديو المحمل
-            cap = cv2.VideoCapture('temp_video.mp4')
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            if total_frames > 0:
-                status.success("تم التحميل بنجاح! جاري استخراج الصور...")
-                cols = st.columns(4)
-                for i in range(1, 5):
-                    # اختيار فريمات موزعة
-                    frame_pos = (total_frames // 5) * i
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-                    ret, frame = cap.read()
-                    if ret:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        with cols[i-1]:
-                            st.image(frame_rgb, caption=f"فريم {i}")
-                    progress_bar.progress(i * 25)
+                info = ydl.extract_info(vk_url, download=False)
+                duration = info.get('duration', 0)
+                video_url = info['url']
+                title = info.get('title', 'video')
+
+        st.success(f"📺 فيديو: {title} | المدة: {duration} ثانية")
+
+        # 2. واجهة اختيار المقطع الزمني
+        st.subheader("حدد المقطع لاستخراج كافة الفريمات منه:")
+        start_time, end_time = st.slider("اختر البداية والنهاية (بالثواني):", 
+                                        0, duration, (0, min(5, duration)))
+        
+        if st.button("استخراج كافة فريمات المقطع"):
+            if end_time - start_time > 10:
+                st.warning("⚠️ يرجى اختيار مقطع أقل من 10 ثوانٍ لتجنب بطء السيرفر.")
             else:
-                st.error("فشل في قراءة ملف الفيديو.")
+                progress_bar = st.progress(0)
+                status = st.empty()
                 
-            cap.release()
-            # حذف الملف المؤقت لتوفير المساحة
-            if os.path.exists("temp_video.mp4"):
-                os.remove("temp_video.mp4")
+                # تحميل المقطع الصغير فقط
+                status.info("جاري معالجة المقطع المختار...")
+                cap = cv2.VideoCapture(video_url)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                start_frame = int(start_time * fps)
+                end_frame = int(end_time * fps)
                 
-        except Exception as e:
-            st.error(f"حدث خطأ تقني: {e}")
-    else:
-        st.warning("يرجى وضع الرابط أولاً.")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                
+                frames_buffer = []
+                current_frame = start_frame
+                
+                # استخراج الفريمات
+                while current_frame <= end_frame:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    # تصغير حجم الصورة لتقليل المساحة
+                    frame_small = cv2.resize(frame, (480, 270)) 
+                    _, buffer = cv2.imencode('.jpg', frame_small, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                    frames_buffer.append(buffer)
+                    
+                    current_frame += 1
+                    progress_bar.progress(min((current_frame - start_frame) / (end_frame - start_frame), 1.0))
+
+                cap.release()
+                
+                # 3. تجهيز ملف ZIP للتحميل
+                if frames_buffer:
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
+                        for idx, frame_data in enumerate(frames_buffer):
+                            zip_file.writestr(f"frame_{idx}.jpg", frame_data.tobytes())
+                    
+                    st.success(f"✅ تم استخراج {len(frames_buffer)} فريم!")
+                    st.download_button(
+                        label="📥 تحميل كافة الفريمات (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name="extracted_frames.zip",
+                        mime="application/zip"
+                    )
+                    
+                    # عرض عينة صغيرة (أول 4 فريمات)
+                    st.write("معاينة لأول 4 فريمات:")
+                    cols = st.columns(4)
+                    for i in range(min(4, len(frames_buffer))):
+                        cols[i].image(frames_buffer[i].tobytes())
+
+    except Exception as e:
+        st.error(f"خطأ: {e}")
